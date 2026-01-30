@@ -1,10 +1,10 @@
 # CFD Miner (CCFDMiner)
 
-A lightweight Python implementation for mining **Conditional Functional Dependencies (CFDs)** from categorical data in CSV format.
+A Python implementation for mining **Constant Conditional Functional Dependencies (CCFDs)** from categorical data in CSV format.
 
 This project parses a CSV dataset into transactions, mines frequent itemsets using **bitset (bitarray) TID-lists** for fast intersections, derives **minimal generators and closures**, and prints CFD-like rules to stdout via Python logging.
 
-> Source file: `CFDMiner.py`. fileciteturn0file0
+> Source file: `CFDMiner.py`.
 
 ---
 
