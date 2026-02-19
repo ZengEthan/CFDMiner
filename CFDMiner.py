@@ -5,12 +5,15 @@ from collections import defaultdict
 from itertools import combinations
 from collections import defaultdict, OrderedDict
 import hashlib
-from typing import List, Dict, DefaultDict, Optional, Any
+from typing import List, Dict, DefaultDict, Optional, Any, Union, Set
 import numpy as np
 import numba
 from collections import Counter
 from bitarray import bitarray  # Core dependency, install with: pip install bitarray
-import struct  # 用于精准控制字节序
+import struct
+import pandas as pd
+from dataclasses import dataclass, field
+from pydantic import BaseModel, Field
 
 # ===================== Log Configuration =====================
 logging.basicConfig(
@@ -97,6 +100,30 @@ class Database:
 
     def frequency(self, item: int) -> int:
         return self.frequencies.get(item, 0)
+    @classmethod
+    def from_dataframe_subset(cls, df: pd.DataFrame, columns: List[str]) -> "Database":
+        """
+
+        """
+        db = cls()
+        #
+        subset_df = df[columns].dropna()
+        
+        for _, row in subset_df.iterrows():
+            transaction = []
+            for col in columns:
+                val = str(row[col]).strip()
+                if val == "":
+                    continue
+                token = DbToken(attr=col, val=val)
+                item_id = db.translate_token(token)
+                db.inc_freq(item_id)
+                transaction.append(item_id)
+            if transaction:  #
+                db.add_row(transaction)
+        
+        logger.info(f"complete：col={columns}，transactions={db.size()}，token={db.nr_items()}")
+        return db
 
 # ===================== MinerNode Class (Fix itersearch compatibility) =====================
 class MinerNode:
@@ -111,16 +138,10 @@ class MinerNode:
 
     def _hash_tids(self) -> int:
         """Fix: Use enumerate instead of itersearch for full bitarray compatibility"""
-        # ijtids_arr = np.array(self.tids, dtype=bool)
-        # 步骤1：读取bitarray的底层字节缓冲区，转成uint8数组（每个元素是1个字节）
         bytes_arr = np.frombuffer(self.tids.tobytes(), dtype=np.uint8)
-        # 步骤2：把每个字节解包成8个位（bit），得到完整的位数组
         bits_arr = np.unpackbits(bytes_arr)
-        # 步骤3：截断到原bitarray的长度（去掉填充的0）
         ijtids_arr = bits_arr[:len(self.tids)].astype(bool)
-        # ijtids_arr = np.array(self.tids.tolist(), dtype=bool)
         hash_val = (np.where(ijtids_arr)[0] + 1).sum()
-        # return sum((i + 1) for i, bit in enumerate(self.tids) if bit)
         return hash_val
 
     def __repr__(self) -> str:
@@ -136,6 +157,39 @@ class GenMapEntry:
         self.supp = supp
         self.hash = hash_val
 
+# ===================== Rule & CandidateRule Data Classes (Updated) =====================
+class RuleDetail(BaseModel):
+    rule: str = Field(
+        ...,
+        description='A natural language expression of the candidate rule.'
+    )
+    explanation: str = Field(
+        ...,
+        description='A clear explanation of the logic and rationale behind the rule'
+    )
+    columns: Set[str] = Field(
+        ...,
+        description='A set of unique column names mentioned in this rule, '
+                   'indicating which columns are referenced in this rule. '
+                   'Note that this field should be specified regardless of possible specifications of columns '
+                   'in the rule field.'
+    )
+
+@dataclass
+class CandidateRule:
+    rule_id: Union[int, str]
+    rule_type: str
+    rule: RuleDetail
+    code: Optional[str] = field(default=None)
+    execution_result: Optional[Dict[str, Union[int, float, List[int]]]] = field(default=None)
+    semantic_validity: Optional[bool] = field(default=None)
+
+    def __str__(self):
+        return (
+            f"CandidateRule(rule_id={self.rule_id}, "
+            f"rule details: {self.rule.rule}, execution_result=omitted)"
+        )
+
 # ===================== CCFDMiner Class (Core refactoring + compatibility fixes) =====================
 class CCFDMiner:
     def __init__(self, db: Database, min_supp: int, max_size: int):
@@ -147,46 +201,37 @@ class CCFDMiner:
         self.global_max_tid = self.db.size() - 1  # Global maximum TID (ensure consistent bitarray length)
         self.item_bitset_cache: dict[int, TidList] = {}  # Cache for item bitarrays
 
-    def run(self):
-        """Execute main CFD mining process"""
+    def run(self, df: pd.DataFrame) -> List[CandidateRule]:
+        """Execute main CFD mining process and return structured rules"""
         singletons = self.get_singletons(self.min_supp)
         self.mine([], singletons, [])
         logger.info("len(self.generators): %s", len(self.generators))
-        self.print_rules()
+        return self.print_rules(df)
 
     def get_singletons(self, min_supp: int) -> list[MinerNode]:
         """Get single-item itemsets meeting minimum support (bitarray throughout)"""
-        # Initialize: each item corresponds to a all-0 bitarray
         item_tids: Dict[int, TidList] = {}
         for item in self.db.frequencies.keys():
             item_tids[item] = bitarray(self.global_max_tid + 1)
             item_tids[item].setall(0)
         
-        # Traverse transactions, set corresponding TID bits to 1
         for tid, row in enumerate(self.db.data):
             for item in row:
                 item_tids[item][tid] = 1
-        # Filter by minimum support, generate MinerNode
+        
         singletons = []
         for item, tids in item_tids.items():
             supp = tids.count()
             if supp >= min_supp:
-                # self.item_bitset_cache[item] = tids  # Cache bitarray
                 singletons.append(MinerNode(item, tids, supp=supp))
-        # Sort by support
         return sorted(singletons, key=lambda x: x.supp)
 
-    # @profile
     def mine(self, prefix: Itemset, items: list[MinerNode], parent_closure: Itemset):
         """Recursively mine frequent itemsets and CFD rules (core logic)"""
         global index
-        logger.debug("len(prefix): %s", len(prefix))
-        # print("prefix:", prefix)
         if len(prefix) == self.max_size:
             return
         
-        # Traverse items in reverse order
-        # print("len(items):", len(items))
         for ix in reversed(range(len(items))):
             node = items[ix]
             iset = self.join_item(prefix, node.item)
@@ -195,9 +240,7 @@ class CCFDMiner:
             joins = []
             suffix = []
 
-            # Branch: choose bucket method or direct intersection calculation
             if len(items) - ix - 1 > 2 * self.db.nr_attrs():
-                # Bucket method (optimize intersection for large itemset counts)
                 ijtid_map = self.bucket_tids(items, ix + 1, node.tids)
                 for jx in range(ix + 1, len(items)):
                     jtem = items[jx].item
@@ -206,35 +249,25 @@ class CCFDMiner:
                     ijtids = ijtid_map[jtem]
                     ijsupp = ijtids.count()
                     
-
                     if ijsupp == node.supp:
                         joins.append(jtem)
                     elif ijsupp >= self.min_supp:
-                        # Fix: Compatible hash calculation
-                        # hash_val = sum((i + 1) for i, bit in enumerate(ijtids) if bit)
-                        # ijtids_arr = np.array(ijtids, dtype=bool)
-                        ijtids_arr = np.array(ijtids.tolist(), dtype=bool)
+                        bytes_arr = np.frombuffer(ijtids.tobytes(), dtype=np.uint8)
+                        bits_arr = np.unpackbits(bytes_arr)
+                        ijtids_arr = bits_arr[:len(ijtids)].astype(bool)
                         hash_val = (np.where(ijtids_arr)[0] + 1).sum()
                         suffix.append(MinerNode(jtem, ijtids, supp=ijsupp, hash_val=hash_val))
             else:
-                # Direct intersection calculation (bitarray bitwise AND, optimal performance)
                 for jx in range(ix + 1, len(items)):
                     j_node = items[jx]
                     global counter
                     counter += 1
-                    # print("counter:", counter)
-                    # Core: bitarray bitwise AND = intersection (native CPU operation)
                     ijtids = node.tids & j_node.tids
                     ijsupp = ijtids.count()
-                    # print("ijsupp:", ijsupp)
-                    # import pdb;pdb.set_trace()
+                    
                     if ijsupp == node.supp:
                         joins.append(j_node.item)
                     elif ijsupp >= self.min_supp:
-                        # Fix: Compatible hash calculation
-                        # hash_val = sum((i + 1) for i, bit in enumerate(ijtids) if bit)
-                        # ijtids_arr = np.array(ijtids, dtype=bool)
-                        # ijtids_arr = np.array(ijtids.tolist(), dtype=bool)
                         bytes_arr = np.frombuffer(ijtids.tobytes(), dtype=np.uint8)
                         bits_arr = np.unpackbits(bytes_arr)
                         ijtids_arr = bits_arr[:len(ijtids)].astype(bool)
@@ -244,12 +277,10 @@ class CCFDMiner:
             if joins:
                 joins.sort()
 
-            # Merge closures
             new_closure = self.join_sets(joins, parent_closure)
             cset = self.join_sets(iset, new_closure)
             post_min_gens = self.get_min_gens(cset, node.supp, node.hash)
 
-            # Process minimal generators
             for ge in post_min_gens:
                 if ge != new_set:
                     add = [x for x in cset if x not in ge.items]
@@ -257,7 +288,6 @@ class CCFDMiner:
                         uni = self.join_sets(add, ge.closure)
                         ge.closure = uni
 
-            # Save generator
             if new_set:
                 new_set.closure = new_closure
                 items_hash = self.hash_itemset(new_set.items)
@@ -267,15 +297,15 @@ class CCFDMiner:
                 index += 1
                 logger.debug("index: %s", index)
 
-            # Recursive mining
             if suffix:
                 suffix.sort(key=lambda x: x.supp)
                 self.mine(iset, suffix, new_closure)
 
-    def print_rules(self):
-        """Print mined CFD rules"""
+    def print_rules(self, df: pd.DataFrame) -> List[CandidateRule]:
+        """Print mined CFD rules and return them as a list of CandidateRule instances"""
         logger.info("len(self.generators): %s", len(self.generators))
         total_number = 0
+        rules_list = []
         for gen in self.generators.values():
             items = gen.items
             rhs = gen.closure
@@ -283,7 +313,6 @@ class CCFDMiner:
             if not rhs:
                 continue
             
-            # Process antecedent conditions
             for leave_out in items:
                 sub = self.subset(items, leave_out)
                 sub_hash = self.hash_itemset(sub)
@@ -298,7 +327,6 @@ class CCFDMiner:
             if not rhs:
                 continue
             
-            # Format output
             head_attrs = []
             head_vals = []
             for item in items:
@@ -306,15 +334,28 @@ class CCFDMiner:
                 head_attrs.append(token.attr)
                 head_vals.append(token.val)
             
-            head_h = f"[{', '.join(head_attrs)}] => "
-            head_v = f"({' ,'.join(head_vals)} || "
-            
             for item in rhs:
                 token = self.db.get_token(item)
-                logger.info("%s%s, %s%s)", head_h, token.attr, head_v, token.val)
+                rule_info = {
+                    "antecedent_attrs": head_attrs,
+                    "antecedent_vals": head_vals,
+                    "consequent_attr": token.attr,
+                    "consequent_val": token.val,
+                    "support": gen.supp
+                }
+                rules_list.append(rule_info)
+                logger.info("%s[%s] => %s (%s || %s)", 
+                            ", ".join(head_attrs), 
+                            ", ".join(head_vals), 
+                            token.attr, 
+                            ", ".join(head_vals), 
+                            token.val)
                 total_number += 1
         logger.info("total_number: %s", total_number)
         logger.info("global counter: %d", counter)
+        
+
+        return convert_cfd_rules_to_candidate_rules(rules_list, df)
 
     @staticmethod
     def join_item(itemset: Itemset, item: int) -> Itemset:
@@ -359,20 +400,14 @@ class CCFDMiner:
         hash_hex = hash_obj.hexdigest()
         hash_val = int(hash_hex, 16)
         return hash_val
-    # @profile
+    
     def add_min_gen(self, new_set: GenMapEntry) -> Optional[GenMapEntry]:
         """Add minimal generator (avoid redundancy)"""
         if new_set.hash in self.gen_map:
-            # print("new_set.hash:", new_set.hash)
-            # print("self.gen_map[new_set.hash]:", self.gen_map[new_set.hash])
             for g in self.gen_map[new_set.hash]:
-                # print("new_set.supp:", new_set.supp)
-                # print("g.supp:", g.supp)
                 if g.supp == new_set.supp:
                     is_subset = self.is_subset(g.items, new_set.items)
                     is_equal = (g.items == new_set.items)
-                    # print("is_subset:", is_subset)
-                    # print("is_equal:", is_equal)
                     if is_subset and not is_equal:
                         return None
                     elif is_equal:
@@ -393,16 +428,14 @@ class CCFDMiner:
     def bucket_tids(self, items: list[MinerNode], start_idx: int, node_tids: TidList) -> dict[int, TidList]:
         """Bucket method to optimize intersection calculation (fix itersearch compatibility)"""
         ijtid_map: Dict[int, TidList] = {}
-        # Initialize: each item corresponds to all-0 bitarray
         for jx in range(start_idx, len(items)):
             item = items[jx].item
             ijtid_map[item] = bitarray(self.global_max_tid + 1)
             ijtid_map[item].setall(0)
         
-        # Fix: Use enumerate instead of itersearch to traverse 1 bits in node_tids
         for t, bit in enumerate(node_tids):
             if not bit:
-                continue  # Only process bits with value 1 (corresponding TIDs)
+                continue
             tup = self.db.get_row(t)
             for item in tup:
                 if item in ijtid_map:
@@ -421,17 +454,14 @@ def load_csv(file_path: str, delim: str = ',', has_headers: bool = True) -> Data
     db = Database()
     with open(file_path, 'r') as f:
         reader = csv.reader(f, delimiter=delim)
-        # Process headers
         headers = next(reader) if has_headers else [f"Attr{i+1}" for i in range(len(next(reader)))]
         
-        # Read data rows
         if has_headers:
             data_rows = list(reader)
         else:
             f.seek(0)
             data_rows = list(reader)
         
-        # Parse each row of data
         for row in data_rows:
             if not row:
                 continue
@@ -446,6 +476,168 @@ def load_csv(file_path: str, delim: str = ',', has_headers: bool = True) -> Data
             db.add_row(transaction)
     
     return db
+
+# ===================== Code Generation & Conversion Functions =====================
+def generate_rule_validate_code(
+    antecedent_attrs: List[str],
+    antecedent_vals: List[str],
+    consequent_attr: str,
+    consequent_val: str,
+    comparison_operator: str = '=='
+) -> str:
+    if len(antecedent_attrs) == 1:
+        condition_str = f"df['{antecedent_attrs[0]}'] == {antecedent_vals[0]}"
+        rule_desc = f"If {antecedent_attrs[0]} = {antecedent_vals[0]}, then {consequent_attr} {comparison_operator} {consequent_val}."
+    else:
+        condition_parts = [f"(df['{attr}'] == {val})" for attr, val in zip(antecedent_attrs, antecedent_vals)]
+        condition_str = " & ".join(condition_parts)
+        antecedent_str = ", ".join([f"{attr} = {val}" for attr, val in zip(antecedent_attrs, antecedent_vals)])
+        rule_desc = f"If {antecedent_str}, then {consequent_attr} {comparison_operator} {consequent_val}."
+
+    code_template = '''import pandas as pd
+
+def validate_rule(df):
+    """
+    Rule: {rule_desc}
+    
+    - <condition_column>: The column to check for the condition.
+    - <condition_value>: The specific value in the condition column that triggers the rule.
+    - <target_column>: The column whose values are being validated based on the rule.
+    - <comparison_operator>: The logical operator (e.g., '==', '!=', 'is not None', etc.).
+    - <target_value>: The value to compare the target column against.
+    """
+
+    # Filter rows where the condition is met
+    condition_rows = df[{condition_str}]
+
+    # Identify violations based on the target column and comparison
+    violations = condition_rows[~(condition_rows['{consequent_attr}'] {comparison_operator} '{consequent_val}')].index.tolist()
+
+    # Identify rows that satisfy the rule
+    satisfactions = condition_rows[(condition_rows['{consequent_attr}'] {comparison_operator} '{consequent_val}')].index.tolist()
+
+    # Calculate support and confidence
+    total_condition = len(condition_rows)
+    support = len(satisfactions) / len(df) if len(df) > 0 else 0
+    confidence = len(satisfactions) / total_condition if total_condition > 0 else 0
+
+    return {{
+        "support": support,
+        "confidence": confidence,
+        "satisfactions": satisfactions,
+        "violations": violations,
+        "total_satisfactions": len(satisfactions),
+        "total_violations": len(violations),
+    }}'''
+    
+    code = code_template.format(
+        rule_desc=rule_desc,
+        condition_str=condition_str,
+        consequent_attr=consequent_attr,
+        comparison_operator=comparison_operator,
+        consequent_val=consequent_val
+    )
+    return code
+
+def execute_validate_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
+    """
+
+    
+    Args:
+        code
+        df
+    
+    Returns:
+
+    """
+    local_namespace = {}
+    try:
+        exec(code, globals(), local_namespace)
+        validate_func = local_namespace['validate_rule']
+        result = validate_func(df)
+        return result
+    except Exception as e:
+        logger.error(f"failure：{e}")
+        return {
+            "support": 0.0,
+            "confidence": 0.0,
+            "satisfactions": [],
+            "violations": [],
+            "total_satisfactions": 0,
+            "total_violations": 0,
+        }
+
+def convert_cfd_rules_to_candidate_rules(cfd_rules: List[Dict[str, Any]], df: pd.DataFrame) -> List[CandidateRule]:
+    """
+    Convert CFD rules from CCFDMiner to CandidateRule instances.
+    
+    Args:
+        cfd_rules: List of rule dictionaries from CCFDMiner.print_rules()
+        
+    Returns:
+        List of CandidateRule instances
+    """
+    candidate_rules = []
+    for idx, rule_dict in enumerate(cfd_rules):
+        rule_id = idx + 1
+        rule_type = "cfd_rule"
+        
+        antecedent_attrs = rule_dict["antecedent_attrs"]
+        antecedent_vals = rule_dict["antecedent_vals"]
+        consequent_attr = rule_dict["consequent_attr"]
+        consequent_val = rule_dict["consequent_val"]
+        support_count = rule_dict["support"]
+        
+        if len(antecedent_attrs) == 1:
+            rule_str = f"If {antecedent_attrs[0]} = '{antecedent_vals[0]}', then {consequent_attr} = '{consequent_val}'."
+        else:
+            antecedent_str = ", ".join([f"{attr} = '{val}'" for attr, val in zip(antecedent_attrs, antecedent_vals)])
+            rule_str = f"If {antecedent_str}, then {consequent_attr} = '{consequent_val}'."
+        
+        explanation_str = ""
+        
+        columns_set = set(antecedent_attrs + [consequent_attr])
+        
+        rule_detail = RuleDetail(
+            rule=rule_str,
+            explanation=explanation_str,
+            columns=columns_set
+        )
+        
+        validate_code = generate_rule_validate_code(
+            antecedent_attrs=antecedent_attrs,
+            antecedent_vals=antecedent_vals,
+            consequent_attr=consequent_attr,
+            consequent_val=consequent_val,
+            comparison_operator='=='
+        )
+        
+        validate_result = execute_validate_code(validate_code, df)
+        
+        # 构建execution_result（使用真实的行ID列表）
+        execution_result = {
+            "rule_id": rule_id,
+            "support": validate_result["support"],
+            "confidence": validate_result["confidence"],
+            "satisfactions": validate_result["satisfactions"],  # 真实的行ID列表
+            "violations": validate_result["violations"],        # 真实的行ID列表
+            "total_satisfactions": validate_result["total_satisfactions"],
+            "total_violations": validate_result["total_violations"],
+            "mined_support_count": support_count  # 保留挖掘得到的支持度计数
+        }
+        
+        candidate_rule = CandidateRule(
+            rule_id=rule_id,
+            rule_type=rule_type,
+            rule=rule_detail,
+            code=validate_code,
+            execution_result=execution_result,
+            semantic_validity=None
+        )
+        
+        candidate_rules.append(candidate_rule)
+    
+    return candidate_rules
 
 # ===================== Main Function =====================
 def main():
@@ -472,7 +664,16 @@ def main():
     # Run CFD mining
     logger.info("Start mining, minimum support: %s, maximum rule size: %s", min_supp, max_size)
     miner = CCFDMiner(db, min_supp, max_size)
-    miner.run()
+    df = pd.read_csv(infile)
+    candidate_rules = miner.run(df)
+    
+    for cr in candidate_rules:
+        print(f"\n=== Rule ID: {cr.rule_id} ===")
+        print(f"Rule (natural language): {cr.rule.rule}")
+        print(f"Explanation: {cr.rule.explanation}")
+        print(f"Columns involved: {cr.rule.columns}")
+        print(f"Execution Result: {cr.execution_result}")
+        print(f"code: {cr.code}")
 
 if __name__ == "__main__":
     main()
